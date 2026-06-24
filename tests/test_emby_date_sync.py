@@ -1,3 +1,6 @@
+import os
+import sqlite3
+import tempfile
 import unittest
 
 from app import emby_date_sync as sync
@@ -18,6 +21,31 @@ class DateSyncTests(unittest.TestCase):
                 1,
             )
         )
+
+    def test_first_import_dates_uses_oldest_import_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = sqlite3.connect(os.path.join(directory, "radarr.db"))
+            try:
+                connection.execute(
+                    "create table History (MovieId integer, Date text, EventType integer)"
+                )
+                connection.executemany(
+                    "insert into History (MovieId, Date, EventType) values (?, ?, ?)",
+                    [
+                        (7, "2026-05-20 16:43:00.2594338Z", 3),
+                        (7, "2026-03-31 00:18:51.1111111Z", 3),
+                        (7, "2026-06-01 10:00:00.0000000Z", 6),
+                        (8, "2026-01-01 00:00:00.0000000Z", 1),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(
+                sync.first_import_dates(directory, "radarr.db", "MovieId"),
+                {7: "2026-03-31T00:18:51.0000000Z"},
+            )
 
     def test_movie_match_prefers_imdb(self):
         item = {
@@ -80,6 +108,37 @@ class DateSyncTests(unittest.TestCase):
         self.assertNotIn("payload", planned[0])
         self.assertEqual(planned[0]["name"], "Movie")
         self.assertEqual(planned[0]["to"], "2026-01-02T00:00:00.0000000Z")
+
+    def test_plan_update_records_series_target_date(self):
+        series_items = [
+            {
+                "Id": "s1",
+                "Name": "Series",
+                "Type": "Series",
+                "DateCreated": "2026-04-01T00:00:00.0000000Z",
+                "ProviderIds": {"Tvdb": "123"},
+            }
+        ]
+        planned, skipped, _ = sync.plan_updates(
+            movies=[],
+            episodes=[],
+            series_items=series_items,
+            radarr={"by_imdb": {}, "by_tmdb": {}, "by_path": {}},
+            sonarr={
+                "by_imdb": {},
+                "by_tvdb": {},
+                "by_path": {},
+                "series_by_imdb": {},
+                "series_by_tvdb": {"123": "2026-03-01T00:00:00.0000000Z"},
+                "series_by_path": {},
+            },
+            tolerance_seconds=1,
+            log_examples=5,
+        )
+        self.assertEqual(skipped, {})
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["type"], "Series")
+        self.assertEqual(planned[0]["to"], "2026-03-01T00:00:00.0000000Z")
 
 
 if __name__ == "__main__":

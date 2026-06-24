@@ -3,7 +3,7 @@
 ## Project
 
 Emby Date Sync is a small Python container that periodically synchronizes Emby
-`DateCreated` values from Radarr/Sonarr file `dateAdded` metadata.
+`DateCreated` values from the first Radarr/Sonarr import history event.
 
 ## Rules
 

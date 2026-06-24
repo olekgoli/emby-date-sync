@@ -1,7 +1,7 @@
 # Emby Date Sync
 
 Small worker container for keeping Emby's `DateCreated` metadata aligned with
-the actual import dates from Radarr and Sonarr.
+the original import dates from Radarr and Sonarr.
 
 The app is intentionally independent from Chronarr and the Chronarr Emby DLL.
 Radarr/Sonarr are the source of truth; Emby is updated through its public HTTP
@@ -10,11 +10,15 @@ API.
 ## Behavior
 
 - reads Radarr and Sonarr API keys from their `config.xml` files,
+- reads the first `downloadFolderImported` history date from `radarr.db` and
+  `sonarr.db`,
 - reads an active Emby user token from Emby's `authentication.db`,
 - fetches movies, series and episodes from Emby,
 - matches movies by IMDb/TMDb/path,
 - matches episodes by file path, then by series IMDb/TVDB + season/episode,
+- matches series by IMDb/TVDB/path,
 - updates only `DateCreated` through `POST /Items/{id}`,
+- ignores later file upgrades by default,
 - supports dry-run and update limits.
 
 ## Local Run
@@ -37,6 +41,10 @@ SONARR_CONFIG_DIR=/sonarr-config \
 SYNC_DRY_RUN=true \
 python app/emby_date_sync.py
 ```
+
+`SYNC_FALLBACK_TO_FILE_DATE=true` can be set for legacy libraries with missing
+Radarr/Sonarr import history. The default is `false`, so a file upgrade does not
+make an existing movie, episode, or series look newly added in Emby.
 
 ## Container
 

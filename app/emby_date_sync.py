@@ -161,6 +161,30 @@ def api_key(config_dir: str) -> str:
     return key
 
 
+def first_import_dates(config_dir: str, db_name: str, item_column: str) -> dict[int, str]:
+    db_path = os.path.join(config_dir, db_name)
+    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        cursor = connection.cursor()
+        # EventType 3 is downloadFolderImported in both Radarr and Sonarr.
+        cursor.execute(
+            f"""
+            select {item_column}, min(Date)
+              from History
+             where EventType = 3
+             group by {item_column}
+            """
+        )
+        dates = {}
+        for item_id, date in cursor.fetchall():
+            target = emby_datetime(date)
+            if item_id and target:
+                dates[int(item_id)] = target
+        return dates
+    finally:
+        connection.close()
+
+
 def emby_token(config_dir: str, user_id: str) -> str:
     db_path = os.path.join(config_dir, "data", "authentication.db")
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
@@ -205,17 +229,26 @@ def emby_headers(token: str) -> dict[str, str]:
     return {"X-Emby-Token": token, "Accept": "application/json"}
 
 
-def fetch_radarr_sources(base_url: str, key: str) -> dict[str, Any]:
+def fetch_radarr_sources(
+    base_url: str,
+    key: str,
+    config_dir: str,
+    fallback_to_file_date: bool,
+) -> dict[str, Any]:
     movies = http_json(base_url.rstrip("/") + "/api/v3/movie", arr_headers(key))
+    import_dates = first_import_dates(config_dir, "radarr.db", "MovieId")
     by_imdb: dict[str, str] = {}
     by_tmdb: dict[str, str] = {}
     by_path: dict[str, str] = {}
     skipped: Counter[str] = Counter()
     for movie in movies:
+        movie_id = movie.get("id")
+        target = import_dates.get(int(movie_id)) if movie_id is not None else None
         movie_file = movie.get("movieFile") or {}
-        target = emby_datetime(movie_file.get("dateAdded"))
+        if not target and fallback_to_file_date:
+            target = emby_datetime(movie_file.get("dateAdded"))
         if not target:
-            skipped["missing_file_date"] += 1
+            skipped["missing_import_history"] += 1
             continue
         imdb = movie.get("imdbId")
         tmdb = movie.get("tmdbId")
@@ -235,30 +268,61 @@ def fetch_radarr_sources(base_url: str, key: str) -> dict[str, Any]:
     }
 
 
-def fetch_sonarr_sources(base_url: str, key: str) -> dict[str, Any]:
+def fetch_sonarr_sources(
+    base_url: str,
+    key: str,
+    config_dir: str,
+    fallback_to_file_date: bool,
+) -> dict[str, Any]:
     base = base_url.rstrip("/")
     headers = arr_headers(key)
     series_items = http_json(base + "/api/v3/series", headers)
+    episode_import_dates = first_import_dates(config_dir, "sonarr.db", "EpisodeId")
+    series_import_dates = first_import_dates(config_dir, "sonarr.db", "SeriesId")
     by_imdb: dict[tuple[str, int, int], str] = {}
     by_tvdb: dict[tuple[str, int, int], str] = {}
     by_path: dict[str, str] = {}
+    series_by_imdb: dict[str, str] = {}
+    series_by_tvdb: dict[str, str] = {}
+    series_by_path: dict[str, str] = {}
     skipped: Counter[str] = Counter()
     for series in series_items:
         series_id = series.get("id")
         if not series_id:
             skipped["series_missing_id"] += 1
             continue
+        imdb = str(series.get("imdbId") or "").casefold() or None
+        tvdb = str(series.get("tvdbId") or "") or None
+        series_target = series_import_dates.get(int(series_id))
+        if not series_target and fallback_to_file_date:
+            series_target = emby_datetime(series.get("added"))
+        if series_target:
+            if imdb:
+                series_by_imdb[imdb] = series_target
+            if tvdb:
+                series_by_tvdb[tvdb] = series_target
+            series_path = normalize_path(series.get("path"))
+            if series_path:
+                series_by_path[series_path] = series_target
+        else:
+            skipped["series_missing_import_history"] += 1
+
         params = urllib.parse.urlencode(
             {"seriesId": series_id, "includeEpisodeFile": "true"}
         )
         episodes = http_json(base + "/api/v3/episode?" + params, headers)
-        imdb = str(series.get("imdbId") or "").casefold() or None
-        tvdb = str(series.get("tvdbId") or "") or None
         for episode in episodes:
+            episode_id = episode.get("id")
+            target = (
+                episode_import_dates.get(int(episode_id))
+                if episode_id is not None
+                else None
+            )
             episode_file = episode.get("episodeFile") or {}
-            target = emby_datetime(episode_file.get("dateAdded"))
+            if not target and fallback_to_file_date:
+                target = emby_datetime(episode_file.get("dateAdded"))
             if not target:
-                skipped["missing_file_date"] += 1
+                skipped["episode_missing_import_history"] += 1
                 continue
             season = episode.get("seasonNumber")
             number = episode.get("episodeNumber")
@@ -276,6 +340,9 @@ def fetch_sonarr_sources(base_url: str, key: str) -> dict[str, Any]:
         "by_imdb": by_imdb,
         "by_tvdb": by_tvdb,
         "by_path": by_path,
+        "series_by_imdb": series_by_imdb,
+        "series_by_tvdb": series_by_tvdb,
+        "series_by_path": series_by_path,
         "raw_series_count": len(series_items),
         "skipped": dict(skipped),
     }
@@ -370,6 +437,28 @@ def episode_target(
     return None, None
 
 
+def series_target(item: dict[str, Any], sonarr: dict[str, Any]) -> tuple[str | None, str | None]:
+    imdb = provider_id(item.get("ProviderIds"), "imdb")
+    if imdb:
+        target = sonarr["series_by_imdb"].get(imdb.casefold())
+        if target:
+            return target, f"series-imdb:{imdb}"
+
+    tvdb = provider_id(item.get("ProviderIds"), "tvdb")
+    if tvdb:
+        target = sonarr["series_by_tvdb"].get(str(tvdb))
+        if target:
+            return target, f"series-tvdb:{tvdb}"
+
+    path = normalize_path(item.get("Path"))
+    if path:
+        target = sonarr["series_by_path"].get(path)
+        if target:
+            return target, "series-path"
+
+    return None, None
+
+
 def plan_updates(
     movies: list[dict[str, Any]],
     episodes: list[dict[str, Any]],
@@ -443,6 +532,29 @@ def plan_updates(
             }
         )
 
+    for item in series_items:
+        target, source = series_target(item, sonarr)
+        if not target:
+            skipped["series_no_arr_match"] += 1
+            if len(examples["series_no_arr_match"]) < log_examples:
+                examples["series_no_arr_match"].append(
+                    {"id": item.get("Id"), "name": item.get("Name")}
+                )
+            continue
+        if date_matches(item.get("DateCreated"), target, tolerance_seconds):
+            skipped["series_already_ok"] += 1
+            continue
+        planned.append(
+            {
+                "id": item.get("Id"),
+                "type": "Series",
+                "name": item.get("Name"),
+                "from": item.get("DateCreated"),
+                "to": target,
+                "source": source,
+            }
+        )
+
     return planned, skipped, examples
 
 
@@ -492,6 +604,7 @@ def apply_updates(base_url: str, token: str, planned: list[dict[str, Any]]) -> t
 
 def main() -> None:
     dry_run = env_bool("SYNC_DRY_RUN", False)
+    fallback_to_file_date = env_bool("SYNC_FALLBACK_TO_FILE_DATE", False)
     max_updates = env_int("SYNC_MAX_UPDATES", 0)
     tolerance_seconds = env_int("SYNC_TOLERANCE_SECONDS", 1)
     log_examples = env_int("SYNC_LOG_EXAMPLES", 5)
@@ -499,14 +612,27 @@ def main() -> None:
     emby_base = env("EMBY_URL", "http://emby:8096/emby")
     radarr_base = env("RADARR_URL", "http://radarr:7878")
     sonarr_base = env("SONARR_URL", "http://sonarr:8989")
+    emby_config_dir = env("EMBY_CONFIG_DIR", "/emby-config")
+    radarr_config_dir = env("RADARR_CONFIG_DIR", "/radarr-config")
+    sonarr_config_dir = env("SONARR_CONFIG_DIR", "/sonarr-config")
 
-    radarr_key = api_key(env("RADARR_CONFIG_DIR", "/radarr-config"))
-    sonarr_key = api_key(env("SONARR_CONFIG_DIR", "/sonarr-config"))
-    token = emby_token(env("EMBY_CONFIG_DIR", "/emby-config"), env("EMBY_TOKEN_USER_ID", "1"))
+    radarr_key = api_key(radarr_config_dir)
+    sonarr_key = api_key(sonarr_config_dir)
+    token = emby_token(emby_config_dir, env("EMBY_TOKEN_USER_ID", "1"))
 
-    log("fetch_sources")
-    radarr = fetch_radarr_sources(radarr_base, radarr_key)
-    sonarr = fetch_sonarr_sources(sonarr_base, sonarr_key)
+    log("fetch_sources", fallback_to_file_date=fallback_to_file_date)
+    radarr = fetch_radarr_sources(
+        radarr_base,
+        radarr_key,
+        radarr_config_dir,
+        fallback_to_file_date,
+    )
+    sonarr = fetch_sonarr_sources(
+        sonarr_base,
+        sonarr_key,
+        sonarr_config_dir,
+        fallback_to_file_date,
+    )
     log(
         "sources_ready",
         radarr_movies=radarr["raw_count"],
@@ -514,6 +640,9 @@ def main() -> None:
         radarr_skipped=radarr["skipped"],
         sonarr_series=sonarr["raw_series_count"],
         sonarr_matches=len(sonarr["by_path"]),
+        sonarr_series_matches=(
+            len(sonarr["series_by_imdb"]) + len(sonarr["series_by_path"])
+        ),
         sonarr_skipped=sonarr["skipped"],
     )
 
@@ -548,6 +677,7 @@ def main() -> None:
         "plan",
         dry_run=dry_run,
         planned=len(planned),
+        planned_by_type=dict(Counter(str(item.get("type")) for item in planned)),
         skipped=dict(skipped),
         examples={key: value for key, value in examples.items()},
         sample=[
