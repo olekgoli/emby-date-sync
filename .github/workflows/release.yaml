@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/olekgoli/emby-date-sync
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Emby Date Sync
+        uses: actions/checkout@v6
+        with:
+          path: emby-date-sync
+
+      - name: Verify release version
+        working-directory: emby-date-sync
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          test "${file_version}" = "${tag_version}"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: emby-date-sync
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          cache-from: type=gha,scope=emby-date-sync-linux-amd64
+          cache-to: type=gha,mode=max,scope=emby-date-sync-linux-amd64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+
+      - name: Resolve image digest
+        id: image
+        run: |
+          set -euo pipefail
+          image="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          digest="$(docker buildx imagetools inspect "${image}" --format '{{.Manifest.Digest}}')"
+          echo "ref=${image}@${digest}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout homelab
+        uses: actions/checkout@v6
+        with:
+          repository: olekgoli/homelab
+          token: ${{ secrets.HOMELAB_REPO_TOKEN }}
+          path: homelab
+
+      - name: Update homelab image
+        working-directory: homelab
+        env:
+          IMAGE_WITH_DIGEST: ${{ steps.image.outputs.ref }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("workloads/media/emby-date-sync/cronjob.yaml")
+          image = os.environ["IMAGE_WITH_DIGEST"]
+          text = path.read_text(encoding="utf-8")
+          old = "image: ghcr.io/olekgoli/emby-date-sync:"
+          lines = []
+          replaced = False
+          for line in text.splitlines():
+              if line.strip().startswith(old):
+                  indent = line[: len(line) - len(line.lstrip())]
+                  lines.append(f"{indent}image: {image}")
+                  replaced = True
+              else:
+                  lines.append(line)
+          if not replaced:
+              raise SystemExit("emby-date-sync image line not found")
+          path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Open homelab deploy PR
+        uses: peter-evans/create-pull-request@v8
+        with:
+          token: ${{ secrets.HOMELAB_REPO_TOKEN }}
+          path: homelab
+          branch: deploy/emby-date-sync-${{ github.ref_name }}
+          commit-message: Deploy Emby Date Sync ${{ github.ref_name }}
+          title: Deploy Emby Date Sync ${{ github.ref_name }}
+          body: |
+            Updates Emby Date Sync to `${{ steps.image.outputs.ref }}`.
+
+            Source tag: `${{ github.ref_name }}`
+            Source commit: `${{ github.sha }}`
+          labels: deploy,emby-date-sync
