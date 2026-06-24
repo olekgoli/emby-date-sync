@@ -161,64 +161,90 @@ def api_key(config_dir: str) -> str:
     return key
 
 
+def sqlite_fetchall(
+    db_path: str,
+    query: str,
+    params: tuple[Any, ...] = (),
+    attempts: int = 5,
+) -> list[tuple[Any, ...]]:
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            connection = sqlite3.connect(
+                f"file:{db_path}?mode=ro",
+                timeout=30,
+                uri=True,
+            )
+            try:
+                cursor = connection.cursor()
+                cursor.execute(query, params)
+                return cursor.fetchall()
+            finally:
+                connection.close()
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if attempt >= attempts:
+                break
+            log(
+                "sqlite_retry",
+                database=os.path.basename(db_path),
+                attempt=attempt,
+                error=str(exc),
+            )
+            time.sleep(min(attempt * 2, 10))
+    raise last_error  # type: ignore[misc]
+
+
 def first_import_dates(config_dir: str, db_name: str, item_column: str) -> dict[int, str]:
     db_path = os.path.join(config_dir, db_name)
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        cursor = connection.cursor()
-        # EventType 3 is downloadFolderImported in both Radarr and Sonarr.
-        cursor.execute(
-            f"""
-            select {item_column}, min(Date)
-              from History
-             where EventType = 3
-             group by {item_column}
-            """
-        )
-        dates = {}
-        for item_id, date in cursor.fetchall():
-            target = emby_datetime(date)
-            if item_id and target:
-                dates[int(item_id)] = target
-        return dates
-    finally:
-        connection.close()
+    # EventType 3 is downloadFolderImported in both Radarr and Sonarr.
+    rows = sqlite_fetchall(
+        db_path,
+        f"""
+        select {item_column}, min(Date)
+          from History
+         where EventType = 3
+         group by {item_column}
+        """,
+    )
+    dates = {}
+    for item_id, date in rows:
+        target = emby_datetime(date)
+        if item_id and target:
+            dates[int(item_id)] = target
+    return dates
 
 
 def emby_token(config_dir: str, user_id: str) -> str:
     db_path = os.path.join(config_dir, "data", "authentication.db")
-    connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-    try:
-        cursor = connection.cursor()
-        if user_id:
-            cursor.execute(
-                """
-                select AccessToken
-                  from Tokens_2
-                 where IsActive = 1 and UserId = ?
-                 order by DateLastActivityInt desc
-                 limit 1
-                """,
-                (int(user_id),),
-            )
-            row = cursor.fetchone()
-            if row:
-                return str(row[0])
-        cursor.execute(
+    if user_id:
+        rows = sqlite_fetchall(
+            db_path,
             """
             select AccessToken
               from Tokens_2
-             where IsActive = 1 and UserId is not null
+             where IsActive = 1 and UserId = ?
              order by DateLastActivityInt desc
              limit 1
-            """
+            """,
+            (int(user_id),),
         )
-        row = cursor.fetchone()
-        if not row:
-            raise RuntimeError("No active Emby user token found")
-        return str(row[0])
-    finally:
-        connection.close()
+        if rows:
+            return str(rows[0][0])
+
+    rows = sqlite_fetchall(
+        db_path,
+        """
+        select AccessToken
+          from Tokens_2
+         where IsActive = 1 and UserId is not null
+         order by DateLastActivityInt desc
+         limit 1
+        """,
+    )
+    if not rows:
+        raise RuntimeError("No active Emby user token found")
+    return str(rows[0][0])
 
 
 def arr_headers(key: str) -> dict[str, str]:
