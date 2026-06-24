@@ -38,6 +38,16 @@ EMBY_FIELDS = ",".join(
     ]
 )
 
+EMBY_PLAN_FIELDS = ",".join(
+    [
+        "DateCreated",
+        "ProviderIds",
+        "Path",
+        "ParentId",
+        "SortName",
+    ]
+)
+
 
 def env(name: str, default: str = "") -> str:
     return os.environ.get(name, default).strip()
@@ -106,8 +116,15 @@ def provider_id(provider_ids: dict[str, Any] | None, name: str) -> str | None:
 
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 90) -> Any:
     request = urllib.request.Request(url, headers=headers or {})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read())
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read())
+        except urllib.error.URLError as exc:
+            last_error = exc
+            time.sleep(min(attempt * 2, 5))
+    raise last_error  # type: ignore[misc]
 
 
 def post_json(
@@ -123,9 +140,16 @@ def post_json(
         method="POST",
         headers={**(headers or {}), "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        response.read()
-        return response.status
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response.read()
+                return response.status
+        except urllib.error.URLError as exc:
+            last_error = exc
+            time.sleep(min(attempt * 2, 5))
+    raise last_error  # type: ignore[misc]
 
 
 def api_key(config_dir: str) -> str:
@@ -257,13 +281,18 @@ def fetch_sonarr_sources(base_url: str, key: str) -> dict[str, Any]:
     }
 
 
-def fetch_emby_items(base_url: str, token: str, item_type: str) -> tuple[list[dict[str, Any]], int | None]:
+def fetch_emby_items(
+    base_url: str,
+    token: str,
+    item_type: str,
+    fields: str = EMBY_PLAN_FIELDS,
+) -> tuple[list[dict[str, Any]], int | None]:
     params = urllib.parse.urlencode(
         {
             "Recursive": "true",
             "IncludeItemTypes": item_type,
             "Limit": "10000",
-            "Fields": EMBY_FIELDS,
+            "Fields": fields,
         }
     )
     response = http_json(
@@ -271,6 +300,23 @@ def fetch_emby_items(base_url: str, token: str, item_type: str) -> tuple[list[di
         emby_headers(token),
     )
     return response.get("Items", []), response.get("TotalRecordCount")
+
+
+def fetch_emby_item(
+    base_url: str,
+    token: str,
+    item_id: Any,
+    fields: str = EMBY_FIELDS,
+) -> dict[str, Any]:
+    params = urllib.parse.urlencode({"Ids": str(item_id), "Fields": fields})
+    response = http_json(
+        base_url.rstrip("/") + "/Items?" + params,
+        emby_headers(token),
+    )
+    items = response.get("Items", [])
+    if len(items) != 1:
+        raise RuntimeError(f"Expected one Emby item {item_id}, got {len(items)}")
+    return items[0]
 
 
 def movie_target(item: dict[str, Any], radarr: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -364,7 +410,6 @@ def plan_updates(
                 "from": item.get("DateCreated"),
                 "to": target,
                 "source": source,
-                "payload": {**item, "DateCreated": target},
             }
         )
 
@@ -395,7 +440,6 @@ def plan_updates(
                 "from": item.get("DateCreated"),
                 "to": target,
                 "source": source,
-                "payload": {**item, "DateCreated": target},
             }
         )
 
@@ -408,10 +452,14 @@ def apply_updates(base_url: str, token: str, planned: list[dict[str, Any]]) -> t
     updated = 0
     for item in planned:
         url = base_url.rstrip("/") + "/Items/" + urllib.parse.quote(str(item["id"]))
+        payload = fetch_emby_item(base_url, token, item["id"])
+        if date_matches(payload.get("DateCreated"), item["to"], 1):
+            continue
+        payload["DateCreated"] = item["to"]
         last_error = None
         for attempt in range(1, 4):
             try:
-                status = post_json(url, item["payload"], headers)
+                status = post_json(url, payload, headers)
                 if status in {200, 204}:
                     updated += 1
                     last_error = None

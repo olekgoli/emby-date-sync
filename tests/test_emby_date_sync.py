@@ -52,7 +52,7 @@ class DateSyncTests(unittest.TestCase):
             ("2026-03-01T00:00:00.0000000Z", "path"),
         )
 
-    def test_plan_update_changes_only_datecreated_in_payload(self):
+    def test_plan_update_records_target_date(self):
         movies = [
             {
                 "Id": "m1",
@@ -77,8 +77,9 @@ class DateSyncTests(unittest.TestCase):
         )
         self.assertEqual(skipped, {})
         self.assertEqual(len(planned), 1)
-        self.assertEqual(planned[0]["payload"]["Name"], "Movie")
-        self.assertEqual(planned[0]["payload"]["DateCreated"], "2026-01-02T00:00:00.0000000Z")
+        self.assertNotIn("payload", planned[0])
+        self.assertEqual(planned[0]["name"], "Movie")
+        self.assertEqual(planned[0]["to"], "2026-01-02T00:00:00.0000000Z")
 
 
 if __name__ == "__main__":

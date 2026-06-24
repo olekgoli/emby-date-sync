@@ -69,10 +69,16 @@ jobs:
           path: homelab
 
       - name: Update homelab image
+        id: homelab_update
         working-directory: homelab
         env:
           IMAGE_WITH_DIGEST: ${{ steps.image.outputs.ref }}
         run: |
+          if [ ! -f workloads/media/emby-date-sync/cronjob.yaml ]; then
+            echo "homelab emby-date-sync manifest is not present yet; skipping deploy PR"
+            echo "updated=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           python - <<'PY'
           import os
           from pathlib import Path
@@ -94,8 +100,10 @@ jobs:
               raise SystemExit("emby-date-sync image line not found")
           path.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
+          echo "updated=true" >> "${GITHUB_OUTPUT}"
 
       - name: Open homelab deploy PR
+        if: steps.homelab_update.outputs.updated == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.HOMELAB_REPO_TOKEN }}
