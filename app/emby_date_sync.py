@@ -114,17 +114,30 @@ def provider_id(provider_ids: dict[str, Any] | None, name: str) -> str | None:
     return None
 
 
-def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 90) -> Any:
-    request = urllib.request.Request(url, headers=headers or {})
-    last_error = None
-    for attempt in range(1, 4):
+def is_transient_http_error(exc: BaseException) -> bool:
+    # HTTPError subclasses URLError, so check it first: only 429 and 5xx are
+    # worth retrying. Plain URLError, timeouts and dropped connections are.
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code == 429 or exc.code >= 500
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError))
+
+
+def http_request(request: urllib.request.Request, timeout: int, attempts: int = 3) -> tuple[int, bytes]:
+    for attempt in range(1, attempts + 1):
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read())
-        except urllib.error.URLError as exc:
-            last_error = exc
+                return response.status, response.read()
+        except Exception as exc:
+            if attempt >= attempts or not is_transient_http_error(exc):
+                raise
             time.sleep(min(attempt * 2, 5))
-    raise last_error  # type: ignore[misc]
+    raise AssertionError("unreachable")
+
+
+def http_json(url: str, headers: dict[str, str] | None = None, timeout: int = 90) -> Any:
+    request = urllib.request.Request(url, headers=headers or {})
+    _, body = http_request(request, timeout)
+    return json.loads(body)
 
 
 def post_json(
@@ -140,16 +153,8 @@ def post_json(
         method="POST",
         headers={**(headers or {}), "Content-Type": "application/json"},
     )
-    last_error = None
-    for attempt in range(1, 4):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                response.read()
-                return response.status
-        except urllib.error.URLError as exc:
-            last_error = exc
-            time.sleep(min(attempt * 2, 5))
-    raise last_error  # type: ignore[misc]
+    status, _ = http_request(request, timeout)
+    return status
 
 
 def api_key(config_dir: str) -> str:
@@ -379,20 +384,30 @@ def fetch_emby_items(
     token: str,
     item_type: str,
     fields: str = EMBY_PLAN_FIELDS,
+    page_size: int = 2000,
 ) -> tuple[list[dict[str, Any]], int | None]:
-    params = urllib.parse.urlencode(
-        {
-            "Recursive": "true",
-            "IncludeItemTypes": item_type,
-            "Limit": "10000",
-            "Fields": fields,
-        }
-    )
-    response = http_json(
-        base_url.rstrip("/") + "/Items?" + params,
-        emby_headers(token),
-    )
-    return response.get("Items", []), response.get("TotalRecordCount")
+    items: list[dict[str, Any]] = []
+    total = None
+    while True:
+        params = urllib.parse.urlencode(
+            {
+                "Recursive": "true",
+                "IncludeItemTypes": item_type,
+                "SortBy": "SortName",
+                "StartIndex": str(len(items)),
+                "Limit": str(page_size),
+                "Fields": fields,
+            }
+        )
+        response = http_json(
+            base_url.rstrip("/") + "/Items?" + params,
+            emby_headers(token),
+        )
+        page = response.get("Items", [])
+        total = response.get("TotalRecordCount", total)
+        items.extend(page)
+        if not page or (total is not None and len(items) >= total):
+            return items, total
 
 
 def fetch_emby_item(
@@ -590,25 +605,22 @@ def apply_updates(base_url: str, token: str, planned: list[dict[str, Any]]) -> t
     updated = 0
     for item in planned:
         url = base_url.rstrip("/") + "/Items/" + urllib.parse.quote(str(item["id"]))
-        payload = fetch_emby_item(base_url, token, item["id"])
-        if date_matches(payload.get("DateCreated"), item["to"], 1):
-            continue
-        payload["DateCreated"] = item["to"]
         last_error = None
-        for attempt in range(1, 4):
-            try:
-                status = post_json(url, payload, headers)
-                if status in {200, 204}:
-                    updated += 1
-                    last_error = None
-                    break
+        try:
+            payload = fetch_emby_item(base_url, token, item["id"])
+            if date_matches(payload.get("DateCreated"), item["to"], 1):
+                continue
+            payload["DateCreated"] = item["to"]
+            status = post_json(url, payload, headers)
+            if status in {200, 204}:
+                updated += 1
+            else:
                 last_error = f"unexpected status {status}"
-            except urllib.error.HTTPError as exc:
-                body = exc.read().decode("utf-8", "replace")[:200]
-                last_error = f"http {exc.code}: {body}"
-            except Exception as exc:
-                last_error = repr(exc)
-            time.sleep(min(attempt * 2, 5))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:200]
+            last_error = f"http {exc.code}: {body}"
+        except Exception as exc:
+            last_error = repr(exc)
 
         if last_error:
             errors.append(
