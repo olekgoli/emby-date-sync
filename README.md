@@ -62,13 +62,14 @@ docker run --rm \
 
 ## Release
 
-Releases are tag-driven:
+Releases are cut from `VERSION`. Bump it and merge to `main`:
 
 ```sh
-git tag v$(cat VERSION)
-git push origin v$(cat VERSION)
+echo 0.2.3 > VERSION
+git commit -am "Release 0.2.3" && git push origin main
 ```
 
-The release workflow builds and pushes
-`ghcr.io/olekgoli/emby-date-sync:<tag>`, resolves the digest, and opens a
-deployment PR against `olekgoli/homelab`.
+The release workflow tags the commit as `v<VERSION>`, runs the tests, builds and
+pushes `ghcr.io/olekgoli/emby-date-sync:<tag>`, resolves the digest, and opens a
+deployment PR against `olekgoli/homelab`. Pushing a `v*.*.*` tag by hand still
+works, and "Run workflow" on the Release action re-runs the current version.

@@ -1,12 +1,25 @@
 name: Release
 
+# A release is cut whenever VERSION changes on main: the workflow tags the
+# commit as v<VERSION> and publishes it. Pushing a v*.*.* tag by hand still
+# works, and "Run workflow" re-runs the release for the current VERSION.
 on:
   push:
+    branches:
+      - main
+    paths:
+      - VERSION
+      - .github/workflows/release.yaml
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -21,18 +34,67 @@ jobs:
         with:
           path: emby-date-sync
 
-      - name: Verify release version
+      - name: Resolve release tag
+        id: release
         working-directory: emby-date-sync
         run: |
           set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          file_version="$(tr -d '[:space:]' < VERSION)"
-          test "${file_version}" = "${tag_version}"
+          version="$(tr -d '[:space:]' < VERSION)"
+          tag="v${version}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            test "${GITHUB_REF_NAME}" = "${tag}"
+            echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+            echo "publish=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "::error::Releases run from main or a v*.*.* tag, not ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          existing="$(git ls-remote --tags origin "refs/tags/${tag}" | cut -f1)"
+          if [ -z "${existing}" ]; then
+            echo "create_tag=true" >> "${GITHUB_OUTPUT}"
+          elif [ "${existing}" != "${GITHUB_SHA}" ]; then
+            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+              echo "::notice::${tag} already exists at ${existing}; nothing to release"
+              echo "publish=false" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+            echo "::error::${tag} already exists at ${existing}; bump VERSION to release ${GITHUB_SHA}"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "publish=true" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Python
+        if: steps.release.outputs.publish == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Test
+        if: steps.release.outputs.publish == 'true'
+        working-directory: emby-date-sync
+        run: |
+          python -m compileall app tests
+          python -m unittest discover -s tests
+
+      - name: Create release tag
+        if: steps.release.outputs.publish == 'true' && steps.release.outputs.create_tag == 'true'
+        working-directory: emby-date-sync
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git tag "${RELEASE_TAG}" "${GITHUB_SHA}"
+          git push origin "refs/tags/${RELEASE_TAG}"
 
       - name: Set up Docker Buildx
+        if: steps.release.outputs.publish == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
+        if: steps.release.outputs.publish == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -40,28 +102,33 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push image
+        if: steps.release.outputs.publish == 'true'
         uses: docker/build-push-action@v7
         with:
           context: emby-date-sync
           platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          tags: ${{ env.IMAGE_NAME }}:${{ steps.release.outputs.tag }}
           cache-from: type=gha,scope=emby-date-sync-linux-amd64
           cache-to: type=gha,mode=max,scope=emby-date-sync-linux-amd64
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.version=${{ steps.release.outputs.tag }}
 
       - name: Resolve image digest
+        if: steps.release.outputs.publish == 'true'
         id: image
+        env:
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
         run: |
           set -euo pipefail
-          image="${IMAGE_NAME}:${GITHUB_REF_NAME}"
+          image="${IMAGE_NAME}:${RELEASE_TAG}"
           digest="$(docker buildx imagetools inspect "${image}" --format '{{.Manifest.Digest}}')"
           echo "ref=${image}@${digest}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout homelab
+        if: steps.release.outputs.publish == 'true'
         uses: actions/checkout@v6
         with:
           repository: olekgoli/homelab
@@ -69,6 +136,7 @@ jobs:
           path: homelab
 
       - name: Update homelab image
+        if: steps.release.outputs.publish == 'true'
         id: homelab_update
         working-directory: homelab
         env:
@@ -103,17 +171,17 @@ jobs:
           echo "updated=true" >> "${GITHUB_OUTPUT}"
 
       - name: Open homelab deploy PR
-        if: steps.homelab_update.outputs.updated == 'true'
+        if: steps.release.outputs.publish == 'true' && steps.homelab_update.outputs.updated == 'true'
         uses: peter-evans/create-pull-request@v8
         with:
           token: ${{ secrets.HOMELAB_REPO_TOKEN }}
           path: homelab
-          branch: deploy/emby-date-sync-${{ github.ref_name }}
-          commit-message: Deploy Emby Date Sync ${{ github.ref_name }}
-          title: Deploy Emby Date Sync ${{ github.ref_name }}
+          branch: deploy/emby-date-sync-${{ steps.release.outputs.tag }}
+          commit-message: Deploy Emby Date Sync ${{ steps.release.outputs.tag }}
+          title: Deploy Emby Date Sync ${{ steps.release.outputs.tag }}
           body: |
             Updates Emby Date Sync to `${{ steps.image.outputs.ref }}`.
 
-            Source tag: `${{ github.ref_name }}`
+            Source tag: `${{ steps.release.outputs.tag }}`
             Source commit: `${{ github.sha }}`
           labels: deploy,emby-date-sync
